@@ -931,6 +931,27 @@ where
     }
 }
 
+impl<'vm, T> Getable<'vm> for Vec<T>
+where
+    T: Getable<'vm>,
+{
+    fn from_value(vm: &'vm Thread, value: Variants) -> Vec<T> {
+        match value.as_ref() {
+            ValueRef::Array(ptr) => ptr.iter().map(|val| T::from_value(vm, val)).collect(),
+            _ => ice!("ValueRef is not an Array"),
+        }
+    }
+
+    unsafe fn from_value_unsafe(vm: &'vm Thread, value: Variants) -> Vec<T> {
+        match value.as_ref() {
+            ValueRef::Array(ptr) => ptr.iter()
+                .map(|val| T::from_value_unsafe(vm, val))
+                .collect(),
+            _ => ice!("ValueRef is not an Array"),
+        }
+    }
+}
+
 impl<'s, T: VmType> VmType for *const T {
     type Type = T::Type;
     fn make_type(vm: &Thread) -> ArcType {
