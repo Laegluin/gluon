@@ -14,6 +14,7 @@ extern crate codespan_reporting;
 pub extern crate either;
 extern crate futures;
 extern crate itertools;
+extern crate os_pipe;
 #[macro_use]
 extern crate log;
 #[macro_use]
@@ -33,9 +34,12 @@ pub extern crate gluon_check as check;
 pub extern crate gluon_parser as parser;
 #[macro_use]
 pub extern crate gluon_vm as vm;
+#[macro_use]
+extern crate gluon_codegen;
 
 pub mod compiler_pipeline;
 pub mod import;
+pub mod process;
 pub mod io;
 #[cfg(all(feature = "rand", not(target_arch = "wasm32")))]
 pub mod rand_bind;
@@ -713,6 +717,7 @@ impl VmBuilder {
         add_extern_module(&vm, "std.thread.prim", ::vm::channel::load_thread);
         add_extern_module(&vm, "std.debug", ::vm::debug::load);
         add_extern_module(&vm, "std.io.prim", ::io::load);
+        add_extern_module(&vm, "std.process.prim", ::process::load);
 
         load_regex(&vm);
         load_random(&vm);
@@ -740,6 +745,23 @@ fn load_random(vm: &Thread) {
 }
 #[cfg(any(not(feature = "rand"), target_arch = "wasm32"))]
 fn load_random(_: &Thread) {}
+
+// this replicates gluon's crate structure as seen by other crates
+// this is a workaround for using the codegen derive macros in the
+// gluon crate itself
+mod gluon {
+    pub mod vm {
+        pub use ::vm::*;
+
+        pub mod api {
+            pub use ::vm::api::*;
+        }
+    }
+
+    pub mod base {
+        pub use ::base::*;
+    }
+}
 
 #[cfg(test)]
 mod tests {
