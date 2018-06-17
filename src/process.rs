@@ -2,7 +2,7 @@ use os_pipe::{self, IntoStdio, PipeReader, PipeWriter};
 use std::io;
 use std::mem;
 use std::process;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use vm::api::IO;
 use vm::thread::Thread;
 use vm::{self, ExternModule};
@@ -10,7 +10,10 @@ use Compiler;
 
 pub fn load(vm: &Thread) -> vm::Result<ExternModule> {
     vm.register_type::<GluonCommand>(stringify!(Command), &[])?;
-    vm.register_type::<GluonChild>(stringify!(Child), &[])?;
+    vm.register_type::<Stdin>(stringify!(Stdin), &[])?;
+    vm.register_type::<Stdout>(stringify!(Stdout), &[])?;
+    vm.register_type::<Stderr>(stringify!(Stderr), &[])?;
+    vm.register_type::<Handle>(stringify!(Handle), &[])?;
 
     Compiler::new()
         .load_script(vm, "std.process.prim.types", PRIM_TYPES)
@@ -19,11 +22,14 @@ pub fn load(vm: &Thread) -> vm::Result<ExternModule> {
     let module = record! {
         cmd => primitive!(3 cmd),
         pipe => primitive!(1 pipe),
-        join => primitive!(1 join),
+        join => primitive!(2 join),
         kill => primitive!(1 kill),
         exit_code_to_io => primitive!(1 exit_code_to_io),
-        type Child => GluonChild,
         type Command => GluonCommand,
+        type Stdin => Stdin,
+        type Stdout => Stdout,
+        type Stderr => Stderr,
+        type Handle => Handle,
     };
 
     ExternModule::new(vm, module)
@@ -46,7 +52,14 @@ const PRIM_TYPES: &str = r#"
         | RemoveVars (Array String)
         | ClearEnv
 
-    { Stdio, CommandOption }
+    type Child = {
+        stdin: Stdin,
+        stdout: Stdout,
+        stderr: Stderr,
+        handle: Handle,
+    }
+
+    { Stdio, CommandOption, Child }
 "#;
 
 #[derive(Getable, VmType, Debug, PartialEq, Copy, Clone)]
@@ -89,16 +102,26 @@ struct Command {
     clear_env: bool,
 }
 
-#[derive(Userdata, Debug)]
-struct GluonChild(Mutex<Child>);
-
-#[derive(Debug)]
+#[derive(Pushable, VmType)]
+#[gluon(vm_type = "std.process.prim.types.Child")]
 struct Child {
-    stdin: Option<PipeWriter>,
-    stdout: Option<PipeReader>,
-    stderr: Option<PipeReader>,
-    inner: process::Child,
+    stdin: Stdin,
+    stdout: Stdout,
+    stderr: Stderr,
+    handle: Handle,
 }
+
+#[derive(Userdata, Debug)]
+struct Stdin(RwLock<Option<PipeWriter>>);
+
+#[derive(Userdata, Debug)]
+struct Stdout(RwLock<Option<PipeReader>>);
+
+#[derive(Userdata, Debug)]
+struct Stderr(RwLock<Option<PipeReader>>);
+
+#[derive(Userdata, Debug)]
+struct Handle(Mutex<process::Child>);
 
 type ExitCode = Option<i32>;
 
@@ -126,7 +149,7 @@ fn cmd(program: String, args: Vec<String>, opts: Vec<CommandOption>) -> GluonCom
     GluonCommand(Arc::new(cmd))
 }
 
-fn pipe(commands: Vec<&GluonCommand>) -> IO<Vec<GluonChild>> {
+fn pipe(commands: Vec<&GluonCommand>) -> IO<Vec<Child>> {
     let num_commands = commands.len();
     let mut prev_stdout = None;
 
@@ -144,9 +167,9 @@ fn pipe(commands: Vec<&GluonCommand>) -> IO<Vec<GluonChild>> {
                 Stdio::Pipe
             };
 
-            let mut child = spawn_child(&cmd, prev_stdout.take(), default_stdin, default_stdout)?;
-            prev_stdout = child.stdout.take();
-            Ok(GluonChild(Mutex::new(child)))
+            let child = spawn_child(&cmd, prev_stdout.take(), default_stdin, default_stdout)?;
+            prev_stdout = child.stdout.0.write().expect("Non-poisoned RwLock").take();
+            Ok(child)
         })
         .collect::<io::Result<Vec<_>>>()
         .into()
@@ -179,19 +202,19 @@ impl OutStream {
     }
 }
 
-fn join(GluonChild(process): &GluonChild) -> IO<ExitCode> {
-    let mut process = process.lock().expect("Non-poisoned mutex");
-    mem::drop(process.stdin.take());
-    process.inner.wait().map(|exit| exit.code()).into()
-}
-
-fn kill(GluonChild(process): &GluonChild) -> IO<()> {
-    process
+fn join(stdin: &Stdin, handle: &Handle) -> IO<ExitCode> {
+    mem::drop(stdin.0.write().expect("Non-poisoned RwLock").take());
+    handle
+        .0
         .lock()
         .expect("Non-poisoned mutex")
-        .inner
-        .kill()
+        .wait()
+        .map(|exit| exit.code())
         .into()
+}
+
+fn kill(handle: &Handle) -> IO<()> {
+    handle.0.lock().expect("Non-poisoned mutex").kill().into()
 }
 
 fn exit_code_to_io(code: ExitCode) -> IO<()> {
@@ -285,9 +308,9 @@ fn spawn_child(
     }
 
     child.stdin(stdin_read).spawn().map(|child| Child {
-        stdin: stdin_write,
-        stdout: stdout_read,
-        stderr: stderr_read,
-        inner: child,
+        stdin: Stdin(RwLock::new(stdin_write)),
+        stdout: Stdout(RwLock::new(stdout_read)),
+        stderr: Stderr(RwLock::new(stderr_read)),
+        handle: Handle(Mutex::new(child)),
     })
 }

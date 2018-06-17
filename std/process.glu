@@ -1,5 +1,5 @@
-let process @ { cmd, pipe, Child } = import! std.process.prim
-let { CommandOption, Stdio } = import! std.process.prim.types
+let process @ { cmd, pipe } = import! std.process.prim
+let { CommandOption, Stdio, Child } = import! std.process.prim.types
 let { Option } = import! std.option
 let { map } = import! std.functor
 let { flat_map, (>>=) } = import! std.monad
@@ -12,7 +12,12 @@ let io @ { ? } = import! std.io
 type ExitCode = Option Int
 
 let exit_code_to_io : ExitCode -> IO () = process.exit_code_to_io
-let join : Child -> IO ExitCode = process.join
+
+let kill child : Child -> IO () =
+    process.kill child.handle
+
+let join child : Child -> IO ExitCode =
+    process.join child.stdin child.handle
 
 let join_all processes : Array Child -> IO (Array ExitCode) =
     sequence io.applicative (map join processes)
@@ -34,11 +39,13 @@ let is_success exit_code : ExitCode -> Bool =
     ExitCode,
     CommandOption,
     Stdio,
+    Child,
     join,
     join_all,
     exit_code_to_io,
     spawn,
     run,
+    kill,
     is_success,
     ..process 
 }
