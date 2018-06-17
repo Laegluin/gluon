@@ -1,9 +1,8 @@
 use proc_macro2::TokenStream;
+use quote::{ToTokens, TokenStreamExt};
 use shared::{map_lifetimes, map_type_params, split_for_impl};
-use syn::{
-    self, Data, DataEnum, DataStruct, DeriveInput, Field, Fields, FieldsNamed, FieldsUnnamed,
-    Generics, Ident, Variant,
-};
+use syn::{self, Data, DataEnum, DataStruct, DeriveInput, Field, Fields, FieldsNamed,
+          FieldsUnnamed, Generics, Ident, Variant};
 
 pub fn derive(input: TokenStream) -> TokenStream {
     let DeriveInput {
@@ -23,18 +22,20 @@ pub fn derive(input: TokenStream) -> TokenStream {
 }
 
 fn derive_struct(ast: DataStruct, ident: Ident, generics: Generics) -> TokenStream {
-    let cons = match ast.fields {
-        Fields::Named(FieldsNamed { named, .. }) => gen_struct_cons(&ident, named),
-        Fields::Unnamed(FieldsUnnamed { unnamed, .. }) => gen_tuple_struct_cons(&ident, unnamed),
-        Fields::Unit => quote! { #ident },
-    };
-
-    gen_impl(ident, generics, cons)
+    match ast.fields {
+        Fields::Named(FieldsNamed { named, .. }) => gen_impl(&ident, generics, |cons_fn| {
+            gen_struct_cons(&ident, &named, cons_fn)
+        }),
+        Fields::Unnamed(FieldsUnnamed { unnamed, .. }) => gen_impl(&ident, generics, |cons_fn| {
+            gen_tuple_struct_cons(&ident, &unnamed, cons_fn)
+        }),
+        Fields::Unit => gen_impl(&ident, generics, |_| quote! { #ident }),
+    }
 }
 
-fn gen_struct_cons<I>(ident: &Ident, fields: I) -> TokenStream
+fn gen_struct_cons<'a, I>(ident: &Ident, fields: I, cons_fn: ConsFn) -> TokenStream
 where
-    I: IntoIterator<Item = Field>,
+    I: IntoIterator<Item = &'a Field>,
 {
     // lookup each field by its name and then convert to its type using the Getable
     // impl of the fields type
@@ -48,7 +49,7 @@ where
 
         quote! {
             #ident: if let Some(val) = data.lookup_field(vm, #quoted_ident) {
-                <#field_ty as ::gluon::vm::api::Getable<'__vm>>::from_value(vm, val)
+                <#field_ty as ::gluon::vm::api::Getable<'__vm>>::#cons_fn(vm, val)
             } else {
                 panic!("Cannot find the field '{}'. Do the type definitions match?", #quoted_ident);
             }
@@ -62,9 +63,9 @@ where
     }
 }
 
-fn gen_tuple_struct_cons<I>(ident: &Ident, fields: I) -> TokenStream
+fn gen_tuple_struct_cons<'a, I>(ident: &Ident, fields: I, cons_fn: ConsFn) -> TokenStream
 where
-    I: IntoIterator<Item = Field>,
+    I: IntoIterator<Item = &'a Field>,
 {
     // do the lookup using the tag, because tuple structs don't have field names
     let field_initializers = fields.into_iter().enumerate().map(|(tag, field)| {
@@ -72,7 +73,7 @@ where
 
         quote! {
             if let Some(val) = data.get_variant(#tag) {
-                <#field_ty as ::gluon::vm::api::Getable<'__vm>>::from_value(vm, val)
+                <#field_ty as ::gluon::vm::api::Getable<'__vm>>::#cons_fn(vm, val)
             } else {
                 panic!("Cannot find the field with tag '{}'. Do the type definitions match?", #tag);
             }
@@ -87,27 +88,29 @@ where
 }
 
 fn derive_enum(ast: DataEnum, ident: Ident, generics: Generics) -> TokenStream {
-    let cons;
-    {
+    let cons_expr = |cons_fn| {
         let variants = ast.variants
             .iter()
             .enumerate()
-            .map(|(tag, variant)| gen_variant_match(&ident, tag, variant));
+            .map(|(tag, variant)| gen_variant_match(&ident, tag, variant, cons_fn));
 
         // data contains the the data for each field of a variant; the variant of the passed value
         // is defined by the tag(), which is defined by order of the variants (the first variant is 0)
-        cons = quote! {
+        quote! {
             match data.tag() as usize {
                 #(#variants,)*
                 tag => panic!("Unexpected tag: '{}'. Do the type definitions match?", tag)
             }
-        };
-    }
+        }
+    };
 
-    gen_impl(ident, generics, cons)
+    gen_impl(&ident, generics, cons_expr)
 }
 
-fn gen_impl(ident: Ident, generics: Generics, cons_expr: TokenStream) -> TokenStream {
+fn gen_impl<F>(ident: &Ident, generics: Generics, mut cons_expr: F) -> TokenStream
+where
+    F: FnMut(ConsFn) -> TokenStream,
+{
     // lifetime bounds like '__vm: 'a, 'a: '__vm (which implies => 'a == '__vm)
     // writing bounds like this is a lot easier than actually replacing all lifetimes
     // with '__vm
@@ -117,6 +120,8 @@ fn gen_impl(ident: Ident, generics: Generics, cons_expr: TokenStream) -> TokenSt
     let getable_bounds = create_getable_bounds(&generics);
 
     let (impl_generics, ty_generics, where_clause) = split_for_impl(&generics, &["'__vm"]);
+    let safe_cons = cons_expr(ConsFn::Safe);
+    let unsafe_cons = cons_expr(ConsFn::Unsafe);
 
     quote! {
         #[automatically_derived]
@@ -130,13 +135,22 @@ fn gen_impl(ident: Ident, generics: Generics, cons_expr: TokenStream) -> TokenSt
                     val => panic!("Unexpected value: '{:?}'. Do the type definitions match?", val),
                 };
 
-                #cons_expr
+                #safe_cons
+            }
+
+            unsafe fn from_value_unsafe(vm: &'__vm ::gluon::vm::thread::Thread, variants: ::gluon::vm::Variants) -> Self {
+                let data = match variants.as_ref() {
+                    ::gluon::vm::api::ValueRef::Data(data) => data,
+                    val => panic!("Unexpected value: '{:?}'. Do the type definitions match?", val),
+                };
+
+                #unsafe_cons
             }
         }
     }
 }
 
-fn gen_variant_match(ident: &Ident, tag: usize, variant: &Variant) -> TokenStream {
+fn gen_variant_match(ident: &Ident, tag: usize, variant: &Variant, cons_fn: ConsFn) -> TokenStream {
     let variant_ident = &variant.ident;
 
     // depending on the type of the variant we need to generate different constructors
@@ -149,14 +163,14 @@ fn gen_variant_match(ident: &Ident, tag: usize, variant: &Variant) -> TokenStrea
         // of the field to get the content from Data::get_variant;
         // the data variable was assigned in the function body above
         Fields::Unnamed(FieldsUnnamed { unnamed, .. }) => {
-            let cons = gen_tuple_variant_cons(unnamed);
+            let cons = gen_tuple_variant_cons(unnamed, cons_fn);
 
             quote! {
                 #tag => #ident::#variant_ident#cons
             }
         }
         Fields::Named(FieldsNamed { named, .. }) => {
-            let cons = gen_struct_variant_cons(named);
+            let cons = gen_struct_variant_cons(named, cons_fn);
 
             quote! {
                 #tag => #ident::#variant_ident#cons
@@ -165,7 +179,7 @@ fn gen_variant_match(ident: &Ident, tag: usize, variant: &Variant) -> TokenStrea
     }
 }
 
-fn gen_tuple_variant_cons<'a, I>(fields: I) -> TokenStream
+fn gen_tuple_variant_cons<'a, I>(fields: I, cons_fn: ConsFn) -> TokenStream
 where
     I: IntoIterator<Item = &'a Field>,
 {
@@ -174,7 +188,7 @@ where
 
         quote! {
             if let Some(val) = data.get_variant(#idx) {
-                <#field_ty as ::gluon::vm::api::Getable<'__vm>>::from_value(vm, val)
+                <#field_ty as ::gluon::vm::api::Getable<'__vm>>::#cons_fn(vm, val)
             } else {
                 panic!("Enum does not contain data at index '{}'. Do the type definitions match?", #idx)
             }
@@ -186,7 +200,7 @@ where
     }
 }
 
-fn gen_struct_variant_cons<'a, I>(fields: I) -> TokenStream
+fn gen_struct_variant_cons<'a, I>(fields: I, cons_fn: ConsFn) -> TokenStream
 where
     I: IntoIterator<Item = &'a Field>,
 {
@@ -199,7 +213,7 @@ where
 
         quote! {
             #field_ident: if let Some(val) = data.get_variant(#idx) {
-                <#field_ty as ::gluon::vm::api::Getable<'__vm>>::from_value(vm, val)
+                <#field_ty as ::gluon::vm::api::Getable<'__vm>>::#cons_fn(vm, val)
             } else {
                 panic!("Enum does not contain data at index '{}'. Do the type definitions match?", #idx)
             }
@@ -223,4 +237,19 @@ fn create_lifetime_bounds(generics: &Generics) -> Vec<TokenStream> {
     map_lifetimes(generics, |lifetime| {
         quote! { #lifetime: '__vm, '__vm: #lifetime }
     })
+}
+
+#[derive(Clone, Copy)]
+enum ConsFn {
+    Safe,
+    Unsafe,
+}
+
+impl ToTokens for ConsFn {
+    fn to_tokens(&self, tokens: &mut TokenStream) {
+        match self {
+            ConsFn::Safe => tokens.append_all(quote! { from_value }),
+            ConsFn::Unsafe => tokens.append_all(quote! { from_value_unsafe }),
+        }
+    }
 }
