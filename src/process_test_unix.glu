@@ -1,0 +1,31 @@
+let { spawn, kill, is_reader_available, is_writer_available, run, CommandOption, Stdio, join } = import! std.process
+let { read_line, read_to_string } = import! std.process
+let { ? } = import! std.io
+let { ? } = import! std.array
+let { (>>), (|>) } = import! std.function
+let { map } = import! std.functor
+let { unwrap_ok } = import! std.result
+let string = import! std.string
+let { flat_map, (>>=) } = import! std.monad
+let { assert } = import! std.test
+
+
+do _ = run "echo" ["begin"]
+
+do proc = spawn "/bin/sh" ["-c", "sleep 60"] []
+assert (not (is_writer_available proc.stdin))
+assert (not (is_reader_available proc.stdout))
+assert (not (is_reader_available proc.stderr))
+do _ = kill proc
+
+do proc = spawn "echo" ["-n", "test\nnew_line"] [Stdin Pipe, Stdout Pipe]
+assert (is_writer_available proc.stdin)
+assert (is_reader_available proc.stdout)
+assert (not (is_reader_available proc.stderr))
+do line = read_line proc.stdout
+assert (line == Some "test\n")
+do rest = read_to_string proc.stdout
+assert (rest == Some "new_line")
+do _ = join proc
+
+run "echo" ["end"]

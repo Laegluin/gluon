@@ -1,5 +1,5 @@
 use os_pipe::{self, IntoStdio, PipeReader, PipeWriter};
-use std::io;
+use std::io::{self, BufRead, BufReader, ErrorKind, Read};
 use std::mem;
 use std::process;
 use std::sync::{Arc, Mutex, RwLock};
@@ -10,9 +10,8 @@ use Compiler;
 
 pub fn load(vm: &Thread) -> vm::Result<ExternModule> {
     vm.register_type::<GluonCommand>(stringify!(Command), &[])?;
-    vm.register_type::<Stdin>(stringify!(Stdin), &[])?;
-    vm.register_type::<Stdout>(stringify!(Stdout), &[])?;
-    vm.register_type::<Stderr>(stringify!(Stderr), &[])?;
+    vm.register_type::<StdStreamWriter>(stringify!(StdStreamWriter), &[])?;
+    vm.register_type::<StdStreamReader>(stringify!(StdStreamReader), &[])?;
     vm.register_type::<Handle>(stringify!(Handle), &[])?;
 
     Compiler::new()
@@ -25,10 +24,14 @@ pub fn load(vm: &Thread) -> vm::Result<ExternModule> {
         join => primitive!(2 join),
         kill => primitive!(1 kill),
         exit_code_to_io => primitive!(1 exit_code_to_io),
+        is_writer_available => primitive!(1 is_writer_available),
+        is_reader_available => primitive!(1 is_reader_available),
+        read => primitive!(1 read),
+        read_to_end => primitive!(1 read_to_end),
+        read_line => primitive!(1 read_line),
         type Command => GluonCommand,
-        type Stdin => Stdin,
-        type Stdout => Stdout,
-        type Stderr => Stderr,
+        type StdStreamWriter => StdStreamWriter,
+        type StdStreamReader => StdStreamReader,
         type Handle => Handle,
     };
 
@@ -53,9 +56,9 @@ const PRIM_TYPES: &str = r#"
         | ClearEnv
 
     type Child = {
-        stdin: Stdin,
-        stdout: Stdout,
-        stderr: Stderr,
+        stdin: StdStreamWriter,
+        stdout: StdStreamReader,
+        stderr: StdStreamReader,
         handle: Handle,
     }
 
@@ -105,25 +108,75 @@ struct Command {
 #[derive(Pushable, VmType)]
 #[gluon(vm_type = "std.process.prim.types.Child")]
 struct Child {
-    stdin: Stdin,
-    stdout: Stdout,
-    stderr: Stderr,
+    stdin: StdStreamWriter,
+    stdout: StdStreamReader,
+    stderr: StdStreamReader,
     handle: Handle,
 }
 
 #[derive(Userdata, Debug)]
-struct Stdin(RwLock<Option<PipeWriter>>);
+struct StdStreamWriter(RwLock<Option<PipeWriter>>);
 
 #[derive(Userdata, Debug)]
-struct Stdout(RwLock<Option<PipeReader>>);
-
-#[derive(Userdata, Debug)]
-struct Stderr(RwLock<Option<PipeReader>>);
+struct StdStreamReader(RwLock<Option<BufReader<PipeReader>>>);
 
 #[derive(Userdata, Debug)]
 struct Handle(Mutex<process::Child>);
 
 type ExitCode = Option<i32>;
+
+fn is_writer_available(writer: &StdStreamWriter) -> bool {
+    writer.0.read().expect("Non-poisoned RwLock").is_some()
+}
+
+fn is_reader_available(reader: &StdStreamReader) -> bool {
+    reader.0.read().expect("Non-poisoned RwLock").is_some()
+}
+
+fn read(reader: &StdStreamReader) -> IO<Vec<u8>> {
+    fn read_inner(reader: &StdStreamReader) -> io::Result<Vec<u8>> {
+        let mut reader = reader.0.write().expect("Non-poisoned RwLock");
+
+        if let Some(ref mut reader) = *reader {
+            let mut buf = vec![0; 4096];
+            let bytes_read = reader.read(&mut buf)?;
+            buf.resize(bytes_read, 0);
+            Ok(buf)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    read_inner(reader).into()
+}
+
+fn read_to_end(reader: &StdStreamReader) -> IO<Vec<u8>> {
+    let mut reader = reader.0.write().expect("Non-poisoned RwLock");
+
+    if let Some(ref mut reader) = *reader {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).map(|_| buf).into()
+    } else {
+        IO::Value(Vec::new())
+    }
+}
+
+fn read_line(reader: &StdStreamReader) -> IO<Option<String>> {
+    let mut reader = reader.0.write().expect("Non-poisoned RwLock");
+    let mut buf = String::new();
+
+    if let Some(ref mut reader) = *reader {
+        match reader.read_line(&mut buf) {
+            Ok(_) => IO::Value(Some(buf)),
+            Err(err) => match err.kind() {
+                ErrorKind::InvalidData => IO::Value(None),
+                _ => IO::from(Err(err)),
+            },
+        }
+    } else {
+        IO::Value(Some(buf))
+    }
+}
 
 fn cmd(program: String, args: Vec<String>, opts: Vec<CommandOption>) -> GluonCommand {
     let mut cmd = Command {
@@ -150,29 +203,44 @@ fn cmd(program: String, args: Vec<String>, opts: Vec<CommandOption>) -> GluonCom
 }
 
 fn pipe(commands: Vec<&GluonCommand>) -> IO<Vec<Child>> {
-    let num_commands = commands.len();
-    let mut prev_stdout = None;
+    fn pipe_inner(commands: Vec<&GluonCommand>) -> io::Result<Vec<Child>> {
+        let mut children: Vec<Child> = Vec::with_capacity(commands.len());
 
-    commands
-        .into_iter()
-        .enumerate()
-        .map(|(i, GluonCommand(cmd))| {
+        for (i, GluonCommand(command)) in commands.iter().enumerate() {
             // always pipe stdin and stdout if not set by the user, except for the first
             // and last processes, where stdin is set to inherit or stdout to inherit,
             // respectively
             let default_stdin = if i == 0 { Stdio::Inherit } else { Stdio::Pipe };
-            let default_stdout = if i == (num_commands - 1) {
+            let default_stdout = if i == (commands.len() - 1) {
                 Stdio::Inherit
             } else {
                 Stdio::Pipe
             };
 
-            let child = spawn_child(&cmd, prev_stdout.take(), default_stdin, default_stdout)?;
-            prev_stdout = child.stdout.0.write().expect("Non-poisoned RwLock").take();
-            Ok(child)
-        })
-        .collect::<io::Result<Vec<_>>>()
-        .into()
+            // extract the stdout handle from the previous process if it is needed for piping
+            // it to the new process' stdin
+            let prev_stdout = if command.stdin.unwrap_or(default_stdin) == Stdio::Pipe && i > 0 {
+                children.get_mut(i - 1).and_then(|child| {
+                    child
+                        .stdout
+                        .0
+                        .write()
+                        .expect("Non-poisoned RwLock")
+                        .take()
+                        .map(BufReader::into_inner)
+                })
+            } else {
+                None
+            };
+
+            let child = spawn_child(&*command, prev_stdout, default_stdin, default_stdout)?;
+            children.push(child);
+        }
+
+        Ok(children)
+    }
+
+    pipe_inner(commands).into()
 }
 
 enum OutStream {
@@ -202,7 +270,7 @@ impl OutStream {
     }
 }
 
-fn join(stdin: &Stdin, handle: &Handle) -> IO<ExitCode> {
+fn join(stdin: &StdStreamWriter, handle: &Handle) -> IO<ExitCode> {
     mem::drop(stdin.0.write().expect("Non-poisoned RwLock").take());
     handle
         .0
@@ -308,9 +376,9 @@ fn spawn_child(
     }
 
     child.stdin(stdin_read).spawn().map(|child| Child {
-        stdin: Stdin(RwLock::new(stdin_write)),
-        stdout: Stdout(RwLock::new(stdout_read)),
-        stderr: Stderr(RwLock::new(stderr_read)),
+        stdin: StdStreamWriter(RwLock::new(stdin_write)),
+        stdout: StdStreamReader(RwLock::new(stdout_read.map(BufReader::new))),
+        stderr: StdStreamReader(RwLock::new(stderr_read.map(BufReader::new))),
         handle: Handle(Mutex::new(child)),
     })
 }

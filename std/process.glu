@@ -1,13 +1,21 @@
-let process @ { cmd, pipe } = import! std.process.prim
+let process @ { cmd, pipe, StdStreamReader } = import! std.process.prim
 let { CommandOption, Stdio, Child } = import! std.process.prim.types
-let { Option } = import! std.option
+let string = import! std.string
 let { map } = import! std.functor
+let { Result } = import! std.result
 let { flat_map, (>>=) } = import! std.monad
 let { wrap } = import! std.applicative
 let { sequence } = import! std.traversable
 let { index, ? } = import! std.array
 let io @ { ? } = import! std.io
 
+
+let read_to_string reader : StdStreamReader -> IO (Option String) =
+    do buf = process.read_to_end reader
+
+    match string.from_utf8 buf with
+    | Ok str -> wrap (Some str)
+    | Err _ -> wrap None
 
 type ExitCode = Option Int
 
@@ -47,5 +55,6 @@ let is_success exit_code : ExitCode -> Bool =
     run,
     kill,
     is_success,
+    read_to_string,
     ..process 
 }
