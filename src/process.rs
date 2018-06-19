@@ -1,5 +1,5 @@
 use os_pipe::{self, IntoStdio, PipeReader, PipeWriter};
-use std::io::{self, BufRead, BufReader, ErrorKind, Read};
+use std::io::{self, BufRead, BufReader, ErrorKind, Read, Write};
 use std::mem;
 use std::process;
 use std::sync::{Arc, Mutex, RwLock};
@@ -29,6 +29,9 @@ pub fn load(vm: &Thread) -> vm::Result<ExternModule> {
         read => primitive!(1 read),
         read_to_end => primitive!(1 read_to_end),
         read_line => primitive!(1 read_line),
+        write => primitive!(2 write),
+        write_all => primitive!(2 write_all),
+        flush => primitive!(1 flush),
         type Command => GluonCommand,
         type StdStreamWriter => StdStreamWriter,
         type StdStreamReader => StdStreamReader,
@@ -131,6 +134,33 @@ fn is_writer_available(writer: &StdStreamWriter) -> bool {
 
 fn is_reader_available(reader: &StdStreamReader) -> bool {
     reader.0.read().expect("Non-poisoned RwLock").is_some()
+}
+
+fn write(writer: &StdStreamWriter, buf: &[u8]) -> IO<usize> {
+    if let Some(ref mut writer) = *writer.0.write().expect("Non-poisoned RwLock") {
+        writer.write(buf).into()
+    } else {
+        IO::Value(0)
+    }
+}
+
+fn write_all(writer: &StdStreamWriter, buf: &[u8]) -> IO<()> {
+    if let Some(ref mut writer) = *writer.0.write().expect("Non-poisoned RwLock") {
+        writer.write_all(buf).into()
+    } else {
+        IO::Exception(format!(
+            "The '{}' cannot be written to because it is not available",
+            stringify!(StdStreamWriter),
+        ))
+    }
+}
+
+fn flush(writer: &StdStreamWriter) -> IO<()> {
+    if let Some(ref mut writer) = *writer.0.write().expect("Non-poisoned RwLock") {
+        writer.flush().into()
+    } else {
+        IO::Value(())
+    }
 }
 
 fn read(reader: &StdStreamReader) -> IO<Vec<u8>> {

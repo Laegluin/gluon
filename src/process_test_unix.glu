@@ -1,5 +1,5 @@
 let { spawn, kill, is_reader_available, is_writer_available, run, CommandOption, Stdio, join } = import! std.process
-let { read_line, read_to_string } = import! std.process
+let { read_line, read_to_string, write_string, write, flush } = import! std.process
 let { ? } = import! std.io
 let { ? } = import! std.array
 let { (>>), (|>) } = import! std.function
@@ -27,5 +27,14 @@ assert (line == Some "test\n")
 do rest = read_to_string proc.stdout
 assert (rest == Some "new_line")
 do _ = join proc
+
+do proc = spawn "cat" [] [Stdin Pipe, Stdout Pipe]
+do bytes_written = write proc.stdin (string.as_bytes "teststring")
+assert (bytes_written == 10)
+do _ = write_string proc.stdin "moredata"
+do _ = flush proc.stdin
+do _ = join proc
+do text = read_to_string proc.stdout
+assert (text == Some "teststringmoredata")
 
 run "echo" ["end"]

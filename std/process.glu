@@ -1,4 +1,4 @@
-let process @ { cmd, pipe, StdStreamReader } = import! std.process.prim
+let process @ { cmd, pipe, StdStreamReader, StdStreamWriter } = import! std.process.prim
 let { CommandOption, Stdio, Child } = import! std.process.prim.types
 let string = import! std.string
 let { map } = import! std.functor
@@ -16,6 +16,9 @@ let read_to_string reader : StdStreamReader -> IO (Option String) =
     match string.from_utf8 buf with
     | Ok str -> wrap (Some str)
     | Err _ -> wrap None
+
+let write_string writer str : StdStreamWriter -> String -> IO () =
+    process.write_all writer (string.as_bytes str)
 
 type ExitCode = Option Int
 
@@ -56,5 +59,6 @@ let is_success exit_code : ExitCode -> Bool =
     kill,
     is_success,
     read_to_string,
+    write_string,
     ..process 
 }
