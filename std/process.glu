@@ -1,13 +1,64 @@
-//@NO-IMPLICIT-PRELUDE
-//! Functions for working with external processes
+let { ExitCode, CommandOption, Stdio } = import! std.process.types
+let process @ { StdStreamReader, StdStreamWriter, Child, Command } = import! std.process.prim
+let string = import! std.string
+let { map } = import! std.functor
+let { Result } = import! std.result
+let { (>>=) } = import! std.monad
+let { (|>) } = import! std.function
+let { wrap } = import! std.applicative
+let { sequence } = import! std.traversable
+let { index, ? } = import! std.array
+let { ? } = import! std.io
 
-let process_prim = import! std.process.prim
-let { Option } = import! std.option
 
-let proc command args = { command, args, env = None, current_dir = None }
+let read_to_string reader : StdStreamReader -> IO (Option String) =
+    do buf = process.read_to_end reader
+
+    match string.from_utf8 buf with
+    | Ok str -> wrap (Some str)
+    | Err _ -> wrap None
+
+let write_string writer str : StdStreamWriter -> String -> IO () =
+    process.write_all writer (string.as_bytes str)
+
+let kill child : Child -> IO () =
+    process.kill child.handle
+
+let join child : Child -> IO ExitCode =
+    process.join child.stdin child.handle
+
+let join_all processes : Array Child -> IO (Array ExitCode) =
+    sequence (map join processes)
+
+let spawn_command cmd : Command -> IO Child =
+    do child = process.pipe [cmd]
+    wrap (index child 0)
+
+let spawn program args opts : String -> Array String -> Array CommandOption -> IO Child =
+    process.command program args opts |> spawn_command
+
+let exec program args : String -> Array String -> IO () =
+    spawn program args [] >>= join >>= process.success_or_exception
+
+let is_success exit_code : ExitCode -> Bool =
+    match exit_code with
+    | Some code -> code == 0
+    | None -> False
+
 
 {
-    proc,
-    ..
-    process_prim
+    ExitCode,
+    CommandOption,
+    Stdio,
+
+    join,
+    join_all,
+    spawn_command,
+    spawn,
+    exec,
+    kill,
+    is_success,
+    read_to_string,
+    write_string,
+    ..process 
 }

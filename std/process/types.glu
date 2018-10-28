@@ -1,0 +1,24 @@
+type ExitCode = Option Int
+
+#[derive(Eq, Show)]
+type Stdio =
+    | Pipe
+    | Inherit
+    | Null
+
+type CommandOption =
+    | Stdin Stdio
+    | Stdout Stdio
+    | Stderr Stdio
+    | RedirectStdout
+    | RedirectStderr
+    | CurrentDir String
+    | SetEnv (Array (String, String))
+    | RemoveEnv (Array String)
+    | ClearEnv
+
+{
+    ExitCode,
+    Stdio,
+    CommandOption
+}
