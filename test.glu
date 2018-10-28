@@ -1,0 +1,17 @@
+let { ? } = import! std.io
+let process @ { exec } = import! std.process
+
+// TODO: closing handles
+
+// FIXME: when not joining, this causes a panic
+// do procs = process.pipe [
+//     process.command "cmd" ["/c", "echo test_string"] [],
+//     process.command "rg" ["str"] []
+// ]
+//
+// process.join_all procs
+
+exec "rg" ["--version"]
+
+// do proc = process.spawn "rg" ["--version"] []
+// process.join proc
